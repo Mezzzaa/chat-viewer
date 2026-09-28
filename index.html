@@ -506,7 +506,7 @@
                         &
                         drop</span>
                     <span class="text-xs text-[#a78bfa] mt-1">Exported WhatsApp .zip or .txt file</span>
-                    <input type="file" id="chat-file-input" accept=".zip,.txt" class="hidden">
+                    <input type="file" id="chat-file-input" accept=".zip,.txt,text/plain,application/zip,application/x-zip-compressed" class="hidden">
                 </label>
 
                 <!-- Demo data button -->
@@ -943,8 +943,8 @@
             const messages = [];
 
             const regexList = [
-                /^\[?(\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s+[AP]M)?)\]?\s+([^:]+):\s*(.*)$/i,
-                /^(\d{1,2}[\/\.-]\d{1,2}[\/\.-]\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s+[AP]M)?)\s+[-–]\s+([^:]+):\s*(.*)$/i
+                /^\[?(\d{1,4}[\/\.-]\d{1,2}[\/\.-]\d{1,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)\]?\s+([^:]+):\s*(.*)$/i,
+                /^(\d{1,4}[\/\.-]\d{1,2}[\/\.-]\d{1,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?)\s+[-–]\s+([^:]+):\s*(.*)$/i
             ];
 
             let currentMessage = null;
@@ -1474,25 +1474,41 @@
         async function handleFile(file) {
             if (!file) return;
 
-            showLoading("Reading File...", `Opening "${file.name}"...`);
+            showLoading("Reading File...", `Opening "${file.name || 'Chat Archive'}"...`);
             await new Promise(r => setTimeout(r, 60));
 
             try {
                 Object.values(mediaFilesMap).forEach(url => URL.revokeObjectURL(url));
                 mediaFilesMap = {};
 
-                if (file.name.toLowerCase().endsWith('.zip')) {
+                const fileNameLower = (file.name || '').toLowerCase();
+                const isZip = fileNameLower.endsWith('.zip') || file.type === 'application/zip' || file.type === 'application/x-zip-compressed';
+
+                if (isZip) {
                     showLoading("Unzipping Archive...", "Extracting chat contents and media attachments...");
                     await new Promise(r => setTimeout(r, 50));
 
-                    const zip = await JSZip.loadAsync(file);
+                    // Use ArrayBuffer for rock-solid iOS Safari compatibility
+                    let buffer;
+                    try {
+                        buffer = await file.arrayBuffer();
+                    } catch (bufErr) {
+                        buffer = file;
+                    }
+
+                    const zip = await JSZip.loadAsync(buffer);
                     let chatTxtFile = null;
                     let txtFileName = "";
 
                     const zipEntries = Object.keys(zip.files);
+                    // 1. First pass: find the real chat .txt file (strictly ignore __MACOSX and ._ shadow files)
                     for (let path of zipEntries) {
-                        if (!zip.files[path].dir && path.toLowerCase().endsWith('.txt')) {
-                            if (!chatTxtFile || path.includes('_chat.txt') || path.toLowerCase().includes('whatsapp chat')) {
+                        if (zip.files[path].dir) continue;
+                        if (path.includes('__MACOSX') || path.split('/').pop().startsWith('._')) continue;
+                        
+                        if (path.toLowerCase().endsWith('.txt')) {
+                            const baseName = path.split('/').pop().toLowerCase();
+                            if (!chatTxtFile || baseName === '_chat.txt' || baseName.includes('chat')) {
                                 chatTxtFile = zip.files[path];
                                 txtFileName = path.split('/').pop();
                             }
@@ -1501,7 +1517,7 @@
 
                     if (!chatTxtFile) {
                         hideLoading();
-                        alert("No .txt chat file found inside the .zip archive!");
+                        alert("No chat .txt file found inside this .zip! Please make sure this is an export from WhatsApp.");
                         return;
                     }
 
@@ -1511,12 +1527,18 @@
                     for (let path of zipEntries) {
                         const entry = zip.files[path];
                         if (entry.dir) continue;
+                        if (path.includes('__MACOSX') || path.split('/').pop().startsWith('._')) continue;
+
                         const fileName = path.split('/').pop();
                         const ext = fileName.split('.').pop().toLowerCase();
 
                         if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov', 'webm', 'opus', 'm4a', 'mp3', 'ogg', 'wav', 'aac', 'caf', 'pdf', 'doc', 'docx', 'txt'].includes(ext)) {
-                            const blob = await entry.async('blob');
-                            mediaFilesMap[fileName] = URL.createObjectURL(blob);
+                            try {
+                                const blob = await entry.async('blob');
+                                mediaFilesMap[fileName] = URL.createObjectURL(blob);
+                            } catch (mediaErr) {
+                                console.warn("Skipping unreadable media item:", fileName, mediaErr);
+                            }
                         }
                     }
 
@@ -1524,8 +1546,15 @@
                     await new Promise(r => setTimeout(r, 50));
 
                     const chatText = await chatTxtFile.async('text');
-                    const derivedTitle = file.name.replace(/\.zip$/i, '').replace(/^WhatsApp Chat with /i, '').replace(/^WhatsApp Chat - /i, '');
+                    const derivedTitle = (file.name || 'WhatsApp Chat').replace(/\.zip$/i, '').replace(/^WhatsApp Chat with /i, '').replace(/^WhatsApp Chat - /i, '');
                     const parsed = parseWhatsAppChat(chatText, derivedTitle);
+
+                    if (!parsed || parsed.length === 0) {
+                        hideLoading();
+                        alert("Chat file was read, but 0 messages could be formatted. Please make sure the chat text format matches WhatsApp exports.");
+                        return;
+                    }
+
                     renderChat(parsed, derivedTitle);
 
                 } else {
@@ -1534,21 +1563,31 @@
 
                     const reader = new FileReader();
                     reader.onload = function (event) {
-                        const text = event.target.result;
-                        const parsed = parseWhatsAppChat(text, file.name);
-                        renderChat(parsed, chatTitle);
-                        hideLoading();
+                        try {
+                            const text = event.target.result;
+                            const derivedTitle = (file.name || 'WhatsApp Chat').replace(/\.txt$/i, '').replace(/^WhatsApp Chat with /i, '').replace(/^WhatsApp Chat - /i, '');
+                            const parsed = parseWhatsAppChat(text, derivedTitle);
+                            if (!parsed || parsed.length === 0) {
+                                alert("No messages detected in this text file. Please ensure it is a valid WhatsApp chat export.");
+                            } else {
+                                renderChat(parsed, derivedTitle);
+                            }
+                        } catch (parseErr) {
+                            alert("Error parsing messages: " + (parseErr.message || parseErr));
+                        } finally {
+                            hideLoading();
+                        }
                     };
-                    reader.onerror = function () {
+                    reader.onerror = function (e) {
                         hideLoading();
-                        alert("Could not read text file.");
+                        alert("Could not read text file: " + (e && e.target && e.target.error ? e.target.error.message : "Read error"));
                     };
                     reader.readAsText(file);
                     return;
                 }
             } catch (err) {
                 console.error("Error reading file:", err);
-                alert("Could not process file. Please ensure it is a valid WhatsApp chat archive.");
+                alert("Error processing chat: " + (err && err.message ? err.message : err));
             } finally {
                 hideLoading();
             }
