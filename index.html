@@ -873,8 +873,112 @@
         let parsedMessages = [];
         let chatTitle = "WhatsApp Chat";
         let mediaFilesMap = {};
+        let zipMediaEntries = {};
         let mySenderName = "";
         let uniqueSendersGlobal = new Set();
+        let currentRenderLimit = 500;
+
+        function escapeRegExp(str) {
+            return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        function extractAttachedFileName(text) {
+            if (!text) return null;
+            const m1 = text.match(/(?:<attached:\s*|&lt;attached:\s*)([^>&]+?)(?:>|&gt;)/i);
+            if (m1) return m1[1].trim();
+
+            const m2 = text.match(/([^\n\r]+?)\s*\((?:file attached|berkas dilampirkan|fichier attaché)\)/i);
+            if (m2) return m2[1].trim();
+
+            const m3 = text.match(/\b((?:IMG|VID|PTT|AUD|STK|DOC|PHOTO|VIDEO|AUDIO)[^\s\n\r]+\.[a-zA-Z0-9]{3,4})\b/i);
+            if (m3) return m3[1].trim();
+
+            return null;
+        }
+
+        async function getMediaBlobUrl(fileName) {
+            if (!fileName) return null;
+            if (mediaFilesMap[fileName]) return mediaFilesMap[fileName];
+            const entry = zipMediaEntries[fileName] || zipMediaEntries[fileName.toLowerCase()];
+            if (!entry) return null;
+            try {
+                const blob = await entry.async('blob');
+                const url = URL.createObjectURL(blob);
+                mediaFilesMap[fileName] = url;
+                return url;
+            } catch (e) {
+                console.warn("Failed to extract media:", fileName, e);
+                return null;
+            }
+        }
+
+        let lazyImageObserver = null;
+        function initLazyImageObserver() {
+            if (lazyImageObserver) {
+                lazyImageObserver.disconnect();
+            }
+            lazyImageObserver = new IntersectionObserver((entries) => {
+                entries.forEach(async (entry) => {
+                    if (entry.isIntersecting) {
+                        const img = entry.target;
+                        lazyImageObserver.unobserve(img);
+                        const fileName = img.dataset.mediaFile;
+                        if (fileName) {
+                            const url = await getMediaBlobUrl(fileName);
+                            if (url) {
+                                img.src = url;
+                                img.onload = () => {
+                                    img.classList.remove('opacity-0');
+                                };
+                            }
+                        }
+                    }
+                });
+            }, { rootMargin: '300px' });
+
+            document.querySelectorAll('.lazy-chat-img').forEach(img => {
+                lazyImageObserver.observe(img);
+            });
+        }
+
+        async function openLazyLightbox(fileName) {
+            let url = mediaFilesMap[fileName];
+            if (!url) {
+                url = await getMediaBlobUrl(fileName);
+            }
+            if (url) {
+                openLightbox(url, fileName);
+            }
+        }
+
+        async function downloadLazyMedia(fileName) {
+            const url = await getMediaBlobUrl(fileName);
+            if (url) {
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+            }
+        }
+
+        async function playLazyVideo(container, fileName) {
+            container.innerHTML = '<div class="h-44 w-full bg-[#180f27] flex items-center justify-center text-white"><i class="fa-solid fa-spinner fa-spin text-2xl text-rose-500"></i></div>';
+            const url = await getMediaBlobUrl(fileName);
+            if (url) {
+                const ext = fileName.split('.').pop().toLowerCase();
+                const videoMime = ext === 'mov' ? 'video/quicktime' : ext === 'webm' ? 'video/webm' : 'video/mp4';
+                container.innerHTML = `<video controls autoplay playsinline class="max-h-80 w-full rounded-xl"><source src="${url}" type="${videoMime}"></video>`;
+            } else {
+                container.innerHTML = `<div class="p-4 text-xs text-rose-300 text-center">Could not load video: ${escapeHtml(fileName)}</div>`;
+            }
+        }
+
+        function loadMoreMessages() {
+            currentRenderLimit += 500;
+            renderChat(parsedMessages, chatTitle, true);
+        }
         function getStoredTheme() {
             try {
                 return localStorage.getItem('wa_viewer_theme') || 'dark-romantic';
@@ -1061,9 +1165,32 @@
                 </div>
             `;
 
+            const totalMessagesCount = messages.length;
+            let displayMessages = messages;
+            let startIndex = 0;
+            let showLoadMore = false;
+
+            if (totalMessagesCount > currentRenderLimit) {
+                startIndex = totalMessagesCount - currentRenderLimit;
+                displayMessages = messages.slice(startIndex);
+                showLoadMore = true;
+            }
+
+            if (showLoadMore) {
+                html += `
+                    <div class="flex justify-center my-3">
+                        <button onclick="loadMoreMessages()" class="bg-[#241338] hover:bg-[#341b52] border border-[#532675] text-[#fbcfe8] text-xs font-semibold py-2 px-5 rounded-full shadow-md transition-all active:scale-95 flex items-center gap-2">
+                            <i class="fa-solid fa-arrow-up text-[10px] text-[#f472b6]"></i>
+                            <span>Load 500 earlier messages (Showing latest ${currentRenderLimit} of ${totalMessagesCount})</span>
+                        </button>
+                    </div>
+                `;
+            }
+
             let currentDateGroup = "";
 
-            messages.forEach((msg, index) => {
+            displayMessages.forEach((msg, relIndex) => {
+                const index = startIndex + relIndex;
                 if (msg.sender && !msg.isSystem) {
                     uniqueSenders.add(msg.sender);
                 }
@@ -1096,46 +1223,43 @@
                     let cleanText = msg.text;
                     let mediaHtml = "";
 
-                    // Check for attached media files from zip
-                    for (const [fileName, blobUrl] of Object.entries(mediaFilesMap)) {
-                        if (msg.text.includes(fileName)) {
-                            const ext = fileName.split('.').pop().toLowerCase();
-                            const upperName = fileName.toUpperCase();
-
+                    // Fast O(1) WhatsApp Media Attachment Detection
+                    const attachedFileName = extractAttachedFileName(msg.text);
+                    if (attachedFileName) {
+                        const entry = zipMediaEntries[attachedFileName] || zipMediaEntries[attachedFileName.toLowerCase()] || (mediaFilesMap[attachedFileName] ? true : null);
+                        if (entry) {
                             cleanText = cleanText
-                                .replace(new RegExp(`<attached:\\s*${fileName}>`, 'gi'), '')
-                                .replace(new RegExp(`&lt;attached:\\s*${fileName}&gt;`, 'gi'), '')
-                                .replace(new RegExp(`${fileName}\\s*\\(file attached\\)`, 'gi'), '')
-                                .replace(fileName, '')
+                                .replace(new RegExp(`(?:<attached:\\s*|&lt;attached:\\s*)${escapeRegExp(attachedFileName)}(?:>|&gt;)`, 'gi'), '')
+                                .replace(new RegExp(`${escapeRegExp(attachedFileName)}\\s*\\((?:file attached|berkas dilampirkan|fichier attaché)\\)`, 'gi'), '')
+                                .replace(attachedFileName, '')
                                 .trim();
 
+                            const ext = attachedFileName.split('.').pop().toLowerCase();
+                            const upperName = attachedFileName.toUpperCase();
                             const isSticker = upperName.includes('STK-') || upperName.includes('STICKER');
+                            const cachedUrl = mediaFilesMap[attachedFileName] || '';
 
                             if (isSticker) {
-                                mediaHtml += `<div class="mt-1 mb-1 sticker-msg" style="background:none;box-shadow:none;padding:0">
-                                    <img src="${blobUrl}" alt="Sticker" class="w-24 h-24 object-contain cursor-pointer hover:scale-105 transition-transform duration-150 drop-shadow-md" onclick="openLightbox('${blobUrl}', 'Sticker')">
+                                mediaHtml = `<div class="mt-1 mb-1 sticker-msg" style="background:none;box-shadow:none;padding:0">
+                                    <img data-media-file="${escapeHtml(attachedFileName)}" src="${cachedUrl || 'data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'96\' height=\'96\'%3E%3Crect width=\'100%25\' height=\'100%25\' fill=\'transparent\'/%3E%3C/svg%3E'}" alt="Sticker" class="lazy-chat-img w-24 h-24 object-contain cursor-pointer hover:scale-105 transition-transform duration-150 drop-shadow-md" onclick="openLazyLightbox('${escapeHtml(attachedFileName)}')">
                                 </div>`;
                             } else if (['jpg', 'jpeg', 'png', 'gif', 'heic'].includes(ext) || (ext === 'webp' && !isSticker)) {
-                                mediaHtml += `<div class="mt-1 mb-1 rounded-xl overflow-hidden max-w-xs md:max-w-sm border border-white/10 shadow-sm">
-                                    <img src="${blobUrl}" alt="${escapeHtml(fileName)}" class="max-h-80 w-auto object-cover rounded-xl cursor-pointer hover:opacity-95 shadow-sm transition-opacity" onclick="openLightbox('${blobUrl}','${escapeHtml(fileName)}')" loading="lazy">
-                                </div>`;
-                            } else if (upperName.includes('PTV-') || upperName.includes('VIDEO_NOTE')) {
-                                mediaHtml += `<div class="mt-2 mb-1 flex justify-center">
-                                    <div class="w-44 h-44 rounded-full overflow-hidden border-2 border-[#f43f5e] shadow-[0_0_20px_rgba(244,63,94,0.4)] relative bg-black shrink-0">
-                                        <video controls playsinline class="w-full h-full object-cover rounded-full">
-                                            <source src="${blobUrl}" type="video/mp4">
-                                        </video>
-                                    </div>
+                                mediaHtml = `<div class="mt-1 mb-1 rounded-xl overflow-hidden max-w-xs md:max-w-sm border border-white/10 shadow-sm bg-[#1a0f2b]">
+                                    <img data-media-file="${escapeHtml(attachedFileName)}" src="${cachedUrl || 'data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' width=\'250\' height=\'180\'%3E%3Crect width=\'100%25\' height=\'100%25\' fill=\'%231a0f2b\'/%3E%3C/svg%3E'}" alt="${escapeHtml(attachedFileName)}" class="lazy-chat-img max-h-80 w-auto object-cover rounded-xl cursor-pointer hover:opacity-95 shadow-sm transition-opacity" onclick="openLazyLightbox('${escapeHtml(attachedFileName)}')">
                                 </div>`;
                             } else if (['mp4', 'mov', 'webm'].includes(ext)) {
-                                const videoMime = ext === 'mov' ? 'video/quicktime' : ext === 'webm' ? 'video/webm' : 'video/mp4';
-                                mediaHtml += `<div class="mt-1 mb-1 rounded-xl overflow-hidden max-w-xs md:max-w-sm border border-white/10 shadow-sm">
-                                    <video controls playsinline preload="metadata" class="max-h-80 w-full rounded-xl">
-                                        <source src="${blobUrl}" type="${videoMime}">
-                                    </video>
+                                mediaHtml = `<div class="mt-1 mb-1 rounded-xl overflow-hidden max-w-xs md:max-w-sm border border-white/10 shadow-sm bg-[#160b24]">
+                                    <div class="video-lazy-container relative cursor-pointer group" onclick="playLazyVideo(this, '${escapeHtml(attachedFileName)}')">
+                                        <div class="h-44 w-full bg-[#180f27] flex flex-col items-center justify-center gap-2 text-white">
+                                            <div class="w-12 h-12 rounded-full bg-rose-600/80 group-hover:bg-rose-600 flex items-center justify-center text-lg shadow-lg group-hover:scale-110 transition-transform">
+                                                <i class="fa-solid fa-play ml-0.5"></i>
+                                            </div>
+                                            <span class="text-xs text-[#fbcfe8] max-w-[80%] truncate font-medium">${escapeHtml(attachedFileName)}</span>
+                                            <span class="text-[10px] text-[#c4b5fd]">Tap to load & play video</span>
+                                        </div>
+                                    </div>
                                 </div>`;
                             } else if (upperName.includes('PTT-') || upperName.includes('AUD-') || ['opus', 'm4a', 'mp3', 'ogg', 'wav', 'aac', 'caf'].includes(ext)) {
-                                const audioMime = ext === 'm4a' ? 'audio/mp4' : ext === 'opus' ? 'audio/ogg; codecs=opus' : ext === 'ogg' ? 'audio/ogg' : ext === 'aac' || ext === 'caf' ? 'audio/aac' : ext === 'wav' ? 'audio/wav' : 'audio/mpeg';
                                 const senderPhoto = isOutgoing ? userAvatars[mySenderName] : userAvatars[msg.sender];
                                 const avatarBg = isOutgoing ? 'from-rose-600 to-pink-600' : getSenderColorClass(msg.sender);
                                 const avatarInitial = isOutgoing ? 'You' : (msg.sender ? msg.sender.charAt(0).toUpperCase() : '?');
@@ -1144,7 +1268,7 @@
                                     ? `<img src="${senderPhoto}" class="w-full h-full object-cover rounded-full">`
                                     : escapeHtml(avatarInitial);
 
-                                mediaHtml += `<div class="voice-note-player flex items-center gap-3 py-1.5 px-2 min-w-[250px] max-w-[320px] select-none my-1 bg-black/20 rounded-xl border border-white/5">
+                                mediaHtml = `<div class="voice-note-player flex items-center gap-3 py-1.5 px-2 min-w-[250px] max-w-[320px] select-none my-1 bg-black/20 rounded-xl border border-white/5" data-file-name="${escapeHtml(attachedFileName)}">
                                     <div class="relative shrink-0">
                                         <div class="w-10 h-10 rounded-full ${senderPhoto ? '' : 'bg-gradient-to-tr ' + avatarBg} text-white font-bold flex items-center justify-center text-xs shadow-sm overflow-hidden" title="${escapeHtml(msg.sender)}">
                                             ${avatarContentHtml}
@@ -1168,17 +1292,15 @@
                                             <button onclick="toggleAudioSpeed(this)" class="px-1.5 py-0.5 rounded bg-[#2d1542] hover:bg-[#3d1d5a] font-bold text-[#fbcfe8] text-[10px] border border-[#48246a]">1x</button>
                                         </div>
                                     </div>
-                                    <audio preload="metadata" ontimeupdate="updateAudioProgress(this)" onended="resetAudioPlayer(this)" class="hidden">
-                                        <source src="${blobUrl}" type="${audioMime}">
-                                    </audio>
+                                    <audio preload="none" ontimeupdate="updateAudioProgress(this)" onended="resetAudioPlayer(this)" class="hidden"></audio>
                                 </div>`;
                             } else {
-                                mediaHtml += `<div class="mt-1 mb-1">
-                                    <a href="${blobUrl}" download="${escapeHtml(fileName)}" class="flex items-center gap-2.5 bg-black/25 hover:bg-black/40 border border-white/10 p-2.5 rounded-xl text-[#fbcfe8] text-xs font-semibold transition-colors">
+                                mediaHtml = `<div class="mt-1 mb-1">
+                                    <button onclick="downloadLazyMedia('${escapeHtml(attachedFileName)}')" class="flex items-center gap-2.5 bg-black/25 hover:bg-black/40 border border-white/10 p-2.5 rounded-xl text-[#fbcfe8] text-xs font-semibold transition-colors text-left w-full">
                                         <i class="fa-solid fa-file-lines text-lg text-[#f43f5e]"></i>
-                                        <span class="truncate">${escapeHtml(fileName)}</span>
+                                        <span class="truncate flex-1">${escapeHtml(attachedFileName)}</span>
                                         <i class="fa-solid fa-download ml-auto text-[#f472b6]"></i>
-                                    </a>
+                                    </button>
                                 </div>`;
                             }
                         }
@@ -1258,6 +1380,7 @@
             } else {
                 messagesScroll.scrollTop = messagesScroll.scrollHeight;
             }
+            initLazyImageObserver();
             populateMediaDrawer();
 
             uploadScreen.classList.add('opacity-0', 'pointer-events-none');
@@ -1521,25 +1644,14 @@
                         return;
                     }
 
-                    showLoading("Processing Media Files...", "Loading photos, videos, and voice notes...");
-                    await new Promise(r => setTimeout(r, 50));
-
+                    // Index media files for fast on-demand lazy loading (prevents iPhone out-of-memory crash)
                     for (let path of zipEntries) {
                         const entry = zip.files[path];
                         if (entry.dir) continue;
                         if (path.includes('__MACOSX') || path.split('/').pop().startsWith('._')) continue;
-
                         const fileName = path.split('/').pop();
-                        const ext = fileName.split('.').pop().toLowerCase();
-
-                        if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'mp4', 'mov', 'webm', 'opus', 'm4a', 'mp3', 'ogg', 'wav', 'aac', 'caf', 'pdf', 'doc', 'docx', 'txt'].includes(ext)) {
-                            try {
-                                const blob = await entry.async('blob');
-                                mediaFilesMap[fileName] = URL.createObjectURL(blob);
-                            } catch (mediaErr) {
-                                console.warn("Skipping unreadable media item:", fileName, mediaErr);
-                            }
-                        }
+                        zipMediaEntries[fileName] = entry;
+                        zipMediaEntries[fileName.toLowerCase()] = entry;
                     }
 
                     showLoading("Rendering Chat...", "Formatting messages with dark romantic aesthetics...");
@@ -1716,49 +1828,51 @@
                     });
                 }
 
-                for (const [fileName, blobUrl] of Object.entries(mediaFilesMap)) {
-                    if (msg.text.includes(fileName)) {
-                        const ext = fileName.split('.').pop().toLowerCase();
-                        const upperName = fileName.toUpperCase();
+                const attachedFileName = extractAttachedFileName(msg.text);
+                if (attachedFileName) {
+                    const entry = zipMediaEntries[attachedFileName] || zipMediaEntries[attachedFileName.toLowerCase()] || (mediaFilesMap[attachedFileName] ? true : null);
+                    if (entry) {
+                        const ext = attachedFileName.split('.').pop().toLowerCase();
+                        const upperName = attachedFileName.toUpperCase();
                         const isSticker = upperName.includes('STK-') || upperName.includes('STICKER');
 
-                        if (isSticker) continue;
-
-                        if (['jpg', 'jpeg', 'png', 'gif', 'heic'].includes(ext) || (ext === 'webp' && !isSticker)) {
-                            extractedMedia.media.push({
-                                type: 'image',
-                                fileName,
-                                blobUrl,
-                                sender: msg.sender,
-                                date: msg.date || msg.time,
-                                originalIndex: idx
-                            });
-                        } else if (['mp4', 'mov', 'webm'].includes(ext)) {
-                            extractedMedia.media.push({
-                                type: 'video',
-                                fileName,
-                                blobUrl,
-                                sender: msg.sender,
-                                date: msg.date || msg.time,
-                                originalIndex: idx
-                            });
-                        } else if (upperName.includes('PTT-') || upperName.includes('AUD-') || ['opus', 'm4a', 'mp3', 'ogg', 'wav', 'aac', 'caf'].includes(ext)) {
-                            const audioMime = ext === 'm4a' ? 'audio/mp4' : ext === 'opus' ? 'audio/ogg; codecs=opus' : ext === 'ogg' ? 'audio/ogg' : ext === 'aac' || ext === 'caf' ? 'audio/aac' : ext === 'wav' ? 'audio/wav' : 'audio/mpeg';
-                            extractedMedia.audio.push({
-                                fileName,
-                                blobUrl,
-                                audioMime,
-                                sender: msg.sender,
-                                date: msg.date || msg.time,
-                                originalIndex: idx
-                            });
-                        } else {
-                            extractedMedia.docs.push({
-                                fileName,
-                                blobUrl,
-                                sender: msg.sender,
-                                date: msg.date || msg.time
-                            });
+                        if (!isSticker) {
+                            if (['jpg', 'jpeg', 'png', 'gif', 'heic'].includes(ext) || (ext === 'webp' && !isSticker)) {
+                                extractedMedia.media.push({
+                                    type: 'image',
+                                    fileName: attachedFileName,
+                                    blobUrl: mediaFilesMap[attachedFileName] || '',
+                                    sender: msg.sender,
+                                    date: msg.date || msg.time,
+                                    originalIndex: idx
+                                });
+                            } else if (['mp4', 'mov', 'webm'].includes(ext)) {
+                                extractedMedia.media.push({
+                                    type: 'video',
+                                    fileName: attachedFileName,
+                                    blobUrl: mediaFilesMap[attachedFileName] || '',
+                                    sender: msg.sender,
+                                    date: msg.date || msg.time,
+                                    originalIndex: idx
+                                });
+                            } else if (upperName.includes('PTT-') || upperName.includes('AUD-') || ['opus', 'm4a', 'mp3', 'ogg', 'wav', 'aac', 'caf'].includes(ext)) {
+                                const audioMime = ext === 'm4a' ? 'audio/mp4' : ext === 'opus' ? 'audio/ogg; codecs=opus' : ext === 'ogg' ? 'audio/ogg' : ext === 'aac' || ext === 'caf' ? 'audio/aac' : ext === 'wav' ? 'audio/wav' : 'audio/mpeg';
+                                extractedMedia.audio.push({
+                                    fileName: attachedFileName,
+                                    blobUrl: mediaFilesMap[attachedFileName] || '',
+                                    audioMime,
+                                    sender: msg.sender,
+                                    date: msg.date || msg.time,
+                                    originalIndex: idx
+                                });
+                            } else {
+                                extractedMedia.docs.push({
+                                    fileName: attachedFileName,
+                                    blobUrl: mediaFilesMap[attachedFileName] || '',
+                                    sender: msg.sender,
+                                    date: msg.date || msg.time
+                                });
+                            }
                         }
                     }
                 }
@@ -2003,11 +2117,30 @@
         })();
 
         // Custom Voice Note Player Helper Functions
-        function toggleCustomAudio(btn) {
+        async function toggleCustomAudio(btn) {
             const container = btn.closest('.voice-note-player');
             const audio = container.querySelector('audio');
             const playIcon = btn.querySelector('.play-icon');
             const pauseIcon = btn.querySelector('.pause-icon');
+            const fileName = container.dataset.fileName;
+
+            if ((!audio.src || audio.src === window.location.href) && fileName) {
+                playIcon.classList.add('hidden');
+                const spinner = document.createElement('i');
+                spinner.className = 'fa-solid fa-spinner fa-spin text-xs';
+                btn.appendChild(spinner);
+
+                const url = await getMediaBlobUrl(fileName);
+                spinner.remove();
+                playIcon.classList.remove('hidden');
+
+                if (url) {
+                    audio.src = url;
+                } else {
+                    alert("Could not load voice note: " + fileName);
+                    return;
+                }
+            }
 
             document.querySelectorAll('.voice-note-player audio').forEach(other => {
                 if (other !== audio && !other.paused) {
